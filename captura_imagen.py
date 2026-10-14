@@ -5,7 +5,7 @@ CLASE = "metal"   # (carpeta de la clase)
 DESTINO = Path("dataset/capturas") / CLASE
 DESTINO.mkdir(parents=True, exist_ok=True)
 
-cap = cv2.VideoCapture(1) #posición de la camara
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # Razer Kiyo X
 n = len(list(DESTINO.glob("*.jpg")))
 
 while True:
