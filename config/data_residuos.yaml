@@ -1,0 +1,13 @@
+# Configuración para entrenamiento nativo de YOLOv8 (Detección con Bounding Boxes)
+# Alineado con las 6 categorías de residuos del proyecto Neuro_Trash_YL
+path: ../dataset_objetos
+train: images/train
+val: images/val
+
+names:
+  0: Plastico
+  1: Metal
+  2: Papel_Carton
+  3: Organico
+  4: Vidrio
+  5: Desecho_General
