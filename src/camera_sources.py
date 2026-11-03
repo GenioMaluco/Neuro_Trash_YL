@@ -1,5 +1,7 @@
 """
-Gestor universal de fuentes de video para Neuro_Trash_YL:
+Gestor universal de fuentes de video para Neuro_Trash_YL.
+Las fuentes USB y OBS se catalogan por separado para no mezclarlas.
+
 1. Soporta cámaras locales (USB / CSI en Raspberry Pi / OBS Virtual Camera).
 2. Incluye respaldo automático de Captura de Ventana de OBS / VDO.Ninja en Windows
    (Win32 PrintWindow / GDI) cuando el driver DirectShow de OBS Virtual Camera no aparece
@@ -9,10 +11,28 @@ Gestor universal de fuentes de video para Neuro_Trash_YL:
 
 import ctypes
 from ctypes import wintypes
+import os
 import platform
+import subprocess
 from typing import Dict, List, Optional, Tuple, Union
+
+# Evita el fallo MSMF "can't grab frame" (-1072875772) en webcams USB de Windows.
+os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
 import cv2
 import numpy as np
+
+
+class ClosedCapture:
+    """Sustituto de VideoCapture cuando no hay fuente usable."""
+
+    def isOpened(self) -> bool:
+        return False
+
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        return False, None
+
+    def release(self) -> None:
+        return None
 
 
 def is_vdo_ninja_url(source: str) -> bool:
@@ -173,6 +193,86 @@ def list_obs_and_vdo_windows() -> List[Dict[str, Union[int, str]]]:
     return found
 
 
+def is_virtual_device_name(name: str) -> bool:
+    n = str(name).lower()
+    return any(
+        token in n
+        for token in (
+            "obs virtual",
+            "obs-camera",
+            "obs camera",
+            "virtual camera",
+            "remote desktop",
+            "rdcamera",
+            "manycam",
+            "snap camera",
+        )
+    )
+
+
+def looks_like_obs_placeholder(frame: Optional[np.ndarray]) -> bool:
+    """Detecta la pantalla azul con logo de OBS Virtual Camera (sin señal)."""
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return False
+    h, w = frame.shape[:2]
+    if h < 80 or w < 80:
+        return False
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    blue = cv2.inRange(hsv, (90, 50, 15), (140, 255, 255))
+    blue_ratio = float(np.count_nonzero(blue)) / blue.size
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    logo = gray[int(h * 0.15) : int(h * 0.58), int(w * 0.32) : int(w * 0.68)]
+    if logo.size == 0:
+        return False
+    return blue_ratio > 0.45 and float(logo.std()) > 35 and float(gray.mean()) < 90
+
+
+def get_windows_video_device_names() -> List[str]:
+    """Nombres de cámaras físicas y virtuales reportados por Windows."""
+    if platform.system() != "Windows":
+        return []
+    try:
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_PnPEntity | "
+                "Where-Object { $_.PNPClass -eq 'Camera' -or "
+                "($_.PNPClass -eq 'MEDIA' -and $_.Name -match 'Camera|Webcam|Kiyo|OBS') } | "
+                "Select-Object -ExpandProperty Name",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except Exception:
+        return []
+    names: List[str] = []
+    seen = set()
+    for line in completed.stdout.splitlines():
+        name = line.strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def physical_usb_camera_names() -> List[str]:
+    return [name for name in get_windows_video_device_names() if not is_virtual_device_name(name)]
+
+
+def _read_usable_frame(cap, attempts: int = 8) -> Tuple[bool, Optional[np.ndarray]]:
+    frame = None
+    ok = False
+    for _ in range(attempts):
+        ok, frame = cap.read()
+        if ok and frame is not None and frame.size > 0:
+            return True, frame
+    return False, None
+
+
 def _try_open_camera_index(cam_idx: int) -> Optional[Tuple[cv2.VideoCapture, str]]:
     """
     Prueba abrir un índice de cámara en Windows probando tanto el backend por defecto
@@ -187,19 +287,15 @@ def _try_open_camera_index(cam_idx: int) -> Optional[Tuple[cv2.VideoCapture, str
             cap.release()
         return None
 
-    # Orden de intentos:
-    # 1. DSHOW simple (como en el script original del usuario)
-    # 2. Backend por defecto de OpenCV (MSMF - muchas veces OBS Virtual Camera solo abre aquí)
-    # 3. DSHOW + MJPG 1280x720
-    # 4. MSMF + MJPG 1280x720
     attempts = [
-        (cv2.CAP_DSHOW, "DSHOW", None),
-        (cv2.CAP_ANY, "AUTO/MSMF", None),
-        (cv2.CAP_DSHOW, "DSHOW+MJPG", "MJPG"),
-        (cv2.CAP_MSMF, "MSMF+MJPG", "MJPG"),
+        (cv2.CAP_DSHOW, "DSHOW", None, None),
+        (cv2.CAP_MSMF, "MSMF", None, None),
+        (cv2.CAP_DSHOW, "DSHOW+MJPG", "MJPG", (1280, 720)),
+        (cv2.CAP_MSMF, "MSMF+YUY2", "YUY2", (640, 480)),
+        (cv2.CAP_MSMF, "MSMF+MJPG", "MJPG", (1280, 720)),
     ]
 
-    for backend, b_name, fourcc_str in attempts:
+    for backend, b_name, fourcc_str, size in attempts:
         cap = cv2.VideoCapture(cam_idx, backend)
         if not cap.isOpened():
             cap.release()
@@ -207,28 +303,63 @@ def _try_open_camera_index(cam_idx: int) -> Optional[Tuple[cv2.VideoCapture, str
 
         if fourcc_str:
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc_str))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        if size:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
 
-        for _ in range(3):
-            ok, frame = cap.read()
-            if ok and frame is not None and frame.size > 0:
-                return cap, b_name
-
+        ok, _frame = _read_usable_frame(cap)
+        if ok:
+            return cap, b_name
         cap.release()
 
     return None
 
 
-def open_video_source(source: Union[int, str], allow_fallback_index: bool = True):
+def _open_index_matching_kind(
+    cam_idx: int,
+    source_kind: str,
+    obs_placeholder_only: bool = False,
+) -> Optional[cv2.VideoCapture]:
+    opened = _try_open_camera_index(cam_idx)
+    if opened is None:
+        return None
+    cap, _backend = opened
+    ok, frame = _read_usable_frame(cap)
+    if not ok:
+        cap.release()
+        return None
+    is_obs_feed = looks_like_obs_placeholder(frame)
+    if source_kind == "usb" and is_obs_feed:
+        cap.release()
+        return None
+    if source_kind == "obs" and obs_placeholder_only and not is_obs_feed:
+        cap.release()
+        return None
+    return cap
+
+
+def _open_first_kind_match(source_kind: str, skip_idx: Optional[int] = None, max_index: int = 6):
+    for idx in range(max_index):
+        if skip_idx is not None and idx == skip_idx:
+            continue
+        cap = _open_index_matching_kind(
+            idx,
+            source_kind,
+            obs_placeholder_only=(source_kind == "obs"),
+        )
+        if cap is not None:
+            return cap
+    return None
+
+
+def open_video_source(
+    source: Union[int, str],
+    allow_fallback_index: bool = False,
+    source_kind: str = "auto",
+):
     """
-    Abre una fuente de video:
-    - Si `source` es `"obs_window:<hwnd>"` o `"obs_auto"`, captura directamente la ventana de OBS / VDO.Ninja.
-    - Si `source` es un índice entero (ej. 0, 1, 2):
-      1) Intenta abrir ese índice con todos los backends disponibles (`DSHOW`, `MSMF`, `AUTO`).
-      2) Si el usuario pidió el índice 1 (pensando que OBS Virtual Camera es la #1), pero en su PC
-         no hay cámara física en el 0 (por lo que OBS Virtual Camera quedó en el índice 0),
-         busca automáticamente en los índices 0, 2, 3 o en la ventana de OBS abierta para que NO falle.
+    Abre exactamente la fuente pedida.
+    `source_kind='usb'` nunca cae a OBS. `source_kind='obs'` nunca abre una webcam USB.
     """
     if isinstance(source, str) and source.startswith("obs_window:"):
         hwnd = int(source.split(":", 1)[1])
@@ -238,29 +369,34 @@ def open_video_source(source: Union[int, str], allow_fallback_index: bool = True
         obs_wins = list_obs_and_vdo_windows()
         if obs_wins:
             return Win32WindowCapture(hwnd=int(obs_wins[0]["hwnd"]), title=str(obs_wins[0]["title"]))
+        cap = _open_first_kind_match("obs")
+        return cap if cap is not None else ClosedCapture()
+
+    if isinstance(source, str) and source == "usb_auto":
+        cap = _open_first_kind_match("usb")
+        return cap if cap is not None else ClosedCapture()
 
     if isinstance(source, int) or (isinstance(source, str) and source.strip().isdigit()):
         cam_idx = int(source)
+        kind = source_kind if source_kind in {"usb", "obs"} else "auto"
+        if kind in {"usb", "obs"}:
+            cap = _open_index_matching_kind(cam_idx, kind)
+            if cap is not None:
+                return cap
+            if allow_fallback_index:
+                cap = _open_first_kind_match(kind, skip_idx=cam_idx)
+                if cap is not None:
+                    return cap
+            return ClosedCapture()
+
         opened = _try_open_camera_index(cam_idx)
         if opened is not None:
             return opened[0]
-
-        # Si falló el índice solicitado (ej. pidió índice 1 pero OBS Virtual Camera está en el 0 o 2):
         if allow_fallback_index:
-            for alt_idx in (0, 2, 3, 1):
-                if alt_idx == cam_idx:
-                    continue
-                alt_opened = _try_open_camera_index(alt_idx)
-                if alt_opened is not None:
-                    return alt_opened[0]
-
-            # Y si ningún índice de cámara abrió pero OBS o VDO.Ninja están abiertos en Windows,
-            # capturar directamente la ventana de OBS / VDO.Ninja para que funcione sin bloquearse
-            obs_wins = list_obs_and_vdo_windows()
-            if obs_wins:
-                return Win32WindowCapture(hwnd=int(obs_wins[0]["hwnd"]), title=str(obs_wins[0]["title"]))
-
-        return cv2.VideoCapture(cam_idx)
+            cap = _open_first_kind_match("usb", skip_idx=cam_idx)
+            if cap is not None:
+                return cap
+        return ClosedCapture()
 
     stream_url = str(source).strip()
     cap = cv2.VideoCapture(stream_url)
@@ -269,45 +405,129 @@ def open_video_source(source: Union[int, str], allow_fallback_index: bool = True
     return cap
 
 
-def probe_available_cameras(max_index: int = 5) -> List[Dict[str, Union[int, str, bool]]]:
-    """
-    Escanea todas las cámaras disponibles (índices 0..max_index-1) Y además detecta
-    cualquier ventana abierta de OBS Studio o VDO.Ninja como fuente seleccionable.
-    """
+def _camera_entry(
+    index: Union[int, str],
+    backend: str,
+    frame: Optional[np.ndarray],
+    kind: str,
+    device_name: str = "",
+) -> Dict[str, Union[int, str, bool, float]]:
+    if frame is not None and frame.size > 0:
+        h, w = frame.shape[:2]
+        mean_brightness = float(frame.mean())
+        resolution = f"{w}x{h}"
+    else:
+        mean_brightness = 0.0
+        resolution = "—"
+    is_placeholder = looks_like_obs_placeholder(frame)
+    is_black = mean_brightness < 4.0
+    if kind == "obs":
+        prefix = device_name or "OBS Virtual Camera"
+        status = "sin señal de escena" if is_placeholder or is_black else "con señal"
+        label = f"{prefix} · índice {index} · {status}"
+    else:
+        prefix = device_name or f"Cámara USB #{index}"
+        status = "ocupada / sin señal" if is_black else "lista"
+        label = f"{prefix} · índice {index} · {status}"
+    return {
+        "index": index,
+        "kind": kind,
+        "backend": backend,
+        "resolution": resolution,
+        "is_black": is_black,
+        "is_placeholder": is_placeholder,
+        "brightness": round(mean_brightness, 1),
+        "device_name": device_name,
+        "label": label,
+    }
+
+
+def probe_available_cameras(max_index: int = 6) -> List[Dict[str, Union[int, str, bool]]]:
+    """Escanea índices OpenCV y los clasifica como USB u OBS."""
     available: List[Dict[str, Union[int, str, bool]]] = []
     for idx in range(max_index):
         opened = _try_open_camera_index(idx)
-        if opened is not None:
-            cap, b_name = opened
-            ok, frame = cap.read()
-            if ok and frame is not None and frame.size > 0:
-                h, w = frame.shape[:2]
-                mean_brightness = float(frame.mean())
-                is_black = mean_brightness < 4.0
-                status_note = "⚠️ Imagen Negra" if is_black else "✅ Con Señal"
-                available.append(
-                    {
-                        "index": idx,
-                        "backend": b_name,
-                        "resolution": f"{w}x{h}",
-                        "is_black": is_black,
-                        "brightness": round(mean_brightness, 1),
-                        "label": f"Cámara #{idx} ({b_name} {w}x{h}) — {status_note}",
-                    }
-                )
-            cap.release()
+        if opened is None:
+            continue
+        cap, b_name = opened
+        ok, frame = _read_usable_frame(cap)
+        if ok and frame is not None:
+            kind = "obs" if looks_like_obs_placeholder(frame) else "usb"
+            available.append(_camera_entry(idx, b_name, frame, kind))
+        cap.release()
 
-    # Añadir también captura directa de ventanas de OBS / VDO.Ninja si están abiertas
     for win in list_obs_and_vdo_windows():
         available.append(
             {
                 "index": f"obs_window:{win['hwnd']}",
+                "kind": "obs",
                 "backend": "Win32-Direct",
                 "resolution": "Ventana",
                 "is_black": False,
+                "is_placeholder": False,
                 "brightness": 100.0,
-                "label": f"🖥️ Ventana Directa: {win['title'][:45]}",
+                "device_name": str(win["title"]),
+                "label": f"Ventana OBS: {str(win['title'])[:45]}",
+            }
+        )
+    return available
+
+
+def list_camera_catalog(max_index: int = 6) -> Dict[str, List[Dict[str, Union[int, str, bool]]]]:
+    """Catálogo separado: cámaras USB físicas vs fuentes OBS."""
+    catalog: Dict[str, List[Dict[str, Union[int, str, bool]]]] = {"usb": [], "obs": []}
+    for cam in probe_available_cameras(max_index=max_index):
+        catalog[str(cam.get("kind", "usb"))].append(cam)
+
+    usb_names = physical_usb_camera_names()
+    unnamed_usb = [c for c in catalog["usb"] if not c.get("device_name")]
+    for cam, name in zip(unnamed_usb, usb_names):
+        cam["device_name"] = name
+        status = "ocupada / sin señal" if cam.get("is_black") else "lista"
+        cam["label"] = f"{name} (USB) · índice {cam['index']} · {status}"
+    has_open_usb = any(not c.get("is_placeholder") for c in catalog["usb"])
+    if usb_names and not has_open_usb:
+        for name in usb_names:
+            catalog["usb"].append(
+                {
+                    "index": "usb_auto",
+                    "kind": "usb",
+                    "backend": "auto",
+                    "resolution": "—",
+                    "is_black": False,
+                    "is_placeholder": False,
+                    "brightness": 0.0,
+                    "device_name": name,
+                    "label": f"{name} (USB conectada)",
+                }
+            )
+    elif not catalog["usb"]:
+        catalog["usb"].append(
+            {
+                "index": "usb_auto",
+                "kind": "usb",
+                "backend": "auto",
+                "resolution": "—",
+                "is_black": False,
+                "is_placeholder": False,
+                "brightness": 0.0,
+                "device_name": "",
+                "label": "Buscar cámara USB automática",
             }
         )
 
-    return available
+    if not any(str(c.get("index", "")).startswith("obs") for c in catalog["obs"]):
+        catalog["obs"].append(
+            {
+                "index": "obs_auto",
+                "kind": "obs",
+                "backend": "auto",
+                "resolution": "—",
+                "is_black": False,
+                "is_placeholder": True,
+                "brightness": 0.0,
+                "device_name": "OBS",
+                "label": "OBS Virtual Camera / ventana de OBS",
+            }
+        )
+    return catalog

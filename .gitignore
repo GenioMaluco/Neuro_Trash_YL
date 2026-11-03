@@ -221,3 +221,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Capturas HITL / Kiyo y logs de reentrenamiento local
+dataset/capturas/
+dataset/hitl/
+dataset/img_test/_contour_preview/

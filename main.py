@@ -91,7 +91,7 @@ def detect_waste_in_stream(
             print("No se pudo leer un fotograma de la fuente de video.")
             break
 
-        detections, latency_ms = detector.analyze_frame(frame, enable_fallback_roi=False)
+        detections, latency_ms = detector.analyze_frame(frame, enable_fallback_roi=True)
         telemetry.record_frame_event(detections, latency_ms)
         annotated = draw_hud(frame, detections, latency_ms, show_legend=True)
 

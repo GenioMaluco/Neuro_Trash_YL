@@ -6,8 +6,8 @@ Motor de Detección y Clasificación Híbrida YOLO (Two-Stage Edge AIoT Engine):
    - Si el objeto ocupa primer plano y el detector no genera caja, aplica un localizador
      de contorno / Saliency ROI automático para asegurar que el objeto tenga su Frame.
 2. Etapa de Refinamiento de Material (Clasificador Especializado TrashNet 92.7%):
-   - Recorta cada Bounding Box detectado (eliminando el fondo ruidoso) y lo evalúa con
-     el modelo entrenado en `runs/residuos/weights/best.pt` (plastic, metal, paper,
+   - Extrae la silueta (Canny/GrabCut) dentro de cada caja, recorta por máscara y
+     evalúa el material con `runs/residuos/weights/best.pt` (plastic, metal, paper,
      cardboard, glass, trash).
    - Combina inteligentemente la detección semántica (que reconoce frutas/orgánicos,
      baterías, latas, botellas) con la clasificación visual de textura/material del recorte.
@@ -38,6 +38,7 @@ from config.settings import (
     TRASHNET_TO_CATEGORY,
     WORLD_WASTE_PROMPTS,
 )
+from src.hitl import attach_entity_ids
 from src.stabilizer import ObjectStabilizer, compute_iou
 
 
@@ -103,44 +104,225 @@ class NeuroTrashDetector:
         cat, subtype = TRASHNET_TO_CATEGORY.get(raw_name, ("No Identificado", raw_name))
         return cat, subtype, top1_conf, probs_dict
 
+    @staticmethod
+    def _edge_foreground_mask(bgr: np.ndarray) -> np.ndarray:
+        """Máscara de primer plano por Canny + morfología (misma idea que el ROI de respaldo)."""
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blurred, 35, 120)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+        return cv2.dilate(closed, kernel, iterations=1)
+
+    @staticmethod
+    def _largest_filled_contour(
+        mask: np.ndarray,
+        min_area: float,
+        max_area: Optional[float] = None,
+    ) -> Optional[np.ndarray]:
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        best = max(contours, key=cv2.contourArea)
+        area = float(cv2.contourArea(best))
+        if area < min_area:
+            return None
+        if max_area is not None and area > max_area:
+            return None
+        return best
+
     def _find_foreground_object_box(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
         """
         Localizador de respaldo cuando el objeto está en primer plano pero el detector genérico
         no generó caja: segmenta el objeto principal respecto al fondo para crear un Frame preciso.
         """
         h, w = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-
-        # Combinar bordes Canny y desviación respecto al color de las esquinas del fondo
-        edges = cv2.Canny(blurred, 35, 120)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return None
-
+        closed = self._edge_foreground_mask(frame)
         min_area = (h * w) * 0.035
         max_area = (h * w) * 0.92
-        best_box = None
-        best_area = 0
+        best_cnt = None
+        best_area = 0.0
 
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
             x, y, cw, ch = cv2.boundingRect(cnt)
-            area = cw * ch
+            area = float(cw * ch)
             if min_area <= area <= max_area and area > best_area:
                 best_area = area
-                pad_x = int(cw * 0.04)
-                pad_y = int(ch * 0.04)
-                best_box = (
-                    max(4, x - pad_x),
-                    max(4, y - pad_y),
-                    min(w - 4, x + cw + pad_x),
-                    min(h - 4, y + ch + pad_y),
-                )
+                best_cnt = (x, y, cw, ch)
 
-        return best_box
+        if best_cnt is None:
+            return None
+
+        x, y, cw, ch = best_cnt
+        pad_x = int(cw * 0.04)
+        pad_y = int(ch * 0.04)
+        return (
+            max(4, x - pad_x),
+            max(4, y - pad_y),
+            min(w - 4, x + cw + pad_x),
+            min(h - 4, y + ch + pad_y),
+        )
+
+    def _grabcut_mask(self, crop_bgr: np.ndarray) -> Optional[np.ndarray]:
+        """Segmenta el objeto con GrabCut en un recorte reducido (1 iteración)."""
+        ch, cw = crop_bgr.shape[:2]
+        if ch < 40 or cw < 40:
+            return None
+        max_side = 160
+        scale = min(1.0, max_side / float(max(ch, cw)))
+        work = crop_bgr
+        if scale < 1.0:
+            work = cv2.resize(
+                crop_bgr,
+                (max(40, int(cw * scale)), max(40, int(ch * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        wh, ww = work.shape[:2]
+        inset_x = max(2, int(ww * 0.06))
+        inset_y = max(2, int(wh * 0.06))
+        rw = ww - 2 * inset_x
+        rh = wh - 2 * inset_y
+        if rw < 12 or rh < 12:
+            return None
+        gc_mask = np.zeros((wh, ww), np.uint8)
+        bgd = np.zeros((1, 65), np.float64)
+        fgd = np.zeros((1, 65), np.float64)
+        try:
+            cv2.grabCut(
+                work,
+                gc_mask,
+                (inset_x, inset_y, rw, rh),
+                bgd,
+                fgd,
+                1,
+                cv2.GC_INIT_WITH_RECT,
+            )
+        except cv2.error:
+            return None
+        binary = np.where(
+            (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD),
+            255,
+            0,
+        ).astype(np.uint8)
+        if cv2.countNonZero(binary) < (wh * ww) * 0.08:
+            return None
+        if binary.shape[:2] != (ch, cw):
+            binary = cv2.resize(binary, (cw, ch), interpolation=cv2.INTER_NEAREST)
+        return binary
+
+    def _extract_object_silhouette(
+        self,
+        frame: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Extrae silueta (contorno + máscara) del objeto dentro de la caja.
+        Primero Canny+morfología; si queda débil, refina con GrabCut.
+        El contorno va en coordenadas del frame completo.
+        """
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = bbox
+        x1, y1 = max(0, int(x1)), max(0, int(y1))
+        x2, y2 = min(w, int(x2)), min(h, int(y2))
+        if (x2 - x1) < 20 or (y2 - y1) < 20:
+            return None, None
+
+        crop = frame[y1:y2, x1:x2]
+        ch, cw = crop.shape[:2]
+        crop_area = float(ch * cw)
+        min_area = crop_area * 0.06
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+        mask_local = None
+        gc_mask = self._grabcut_mask(crop)
+        if gc_mask is not None:
+            gc_cover = cv2.countNonZero(gc_mask) / crop_area
+            if 0.08 <= gc_cover <= 0.88:
+                mask_local = gc_mask
+
+        if mask_local is None:
+            edge_mask = self._edge_foreground_mask(crop)
+            edge_mask = cv2.morphologyEx(edge_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+            contour_local = self._largest_filled_contour(edge_mask, min_area)
+            if contour_local is None:
+                return None, None
+            mask_local = np.zeros((ch, cw), np.uint8)
+            cv2.drawContours(mask_local, [contour_local], -1, 255, -1)
+
+        mask_local = cv2.morphologyEx(mask_local, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask_local = cv2.morphologyEx(mask_local, cv2.MORPH_OPEN, kernel, iterations=1)
+        # Corta brazos delgados (picos de Canny) conservando el núcleo del objeto
+        dist = cv2.distanceTransform(mask_local, cv2.DIST_L2, 5)
+        max_d = float(dist.max())
+        if max_d >= 6.0:
+            cut = max(2.0, max_d * 0.16)
+            _, cores = cv2.threshold(dist, cut, 255, cv2.THRESH_BINARY)
+            cores = cv2.dilate(cores.astype(np.uint8), kernel, iterations=2)
+            if cv2.countNonZero(cores) >= min_area:
+                mask_local = cores
+
+        blur_k = 7 if min(ch, cw) >= 80 else 5
+        blurred = cv2.GaussianBlur(mask_local, (blur_k, blur_k), 0)
+        _, mask_local = cv2.threshold(blurred, 80, 255, cv2.THRESH_BINARY)
+
+        contour_local = self._largest_filled_contour(mask_local, min_area)
+        if contour_local is None:
+            return None, None
+
+        area = float(cv2.contourArea(contour_local))
+        peri = cv2.arcLength(contour_local, True)
+        compactness = (4.0 * np.pi * area / (peri * peri)) if peri > 0 else 0.0
+        if compactness < 0.10:
+            return None, None
+
+        epsilon = max(0.6, 0.0015 * peri)
+        approx = cv2.approxPolyDP(contour_local, epsilon, True)
+        if 8 <= len(approx) <= len(contour_local):
+            contour_local = approx
+
+        contour = contour_local.astype(np.int32).copy()
+        contour[:, 0, 0] += x1
+        contour[:, 0, 1] += y1
+
+        full_mask = np.zeros((h, w), np.uint8)
+        full_mask[y1:y2, x1:x2] = mask_local
+        return contour, full_mask
+
+    def _masked_material_crop(
+        self,
+        frame: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+        mask: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """Recorta por máscara/contorno: menos fondo de mesa, mejor señal de material."""
+        x1, y1, x2, y2 = bbox
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return crop
+        if mask is None:
+            return crop
+
+        local = mask[y1:y2, x1:x2]
+        if local.size == 0 or cv2.countNonZero(local) < 32:
+            return crop
+
+        ys, xs = np.where(local > 0)
+        pad = 2
+        mx1 = max(0, int(xs.min()) - pad)
+        mx2 = min(local.shape[1], int(xs.max()) + 1 + pad)
+        my1 = max(0, int(ys.min()) - pad)
+        my2 = min(local.shape[0], int(ys.max()) + 1 + pad)
+        tight = crop[my1:my2, mx1:mx2]
+        tight_mask = local[my1:my2, mx1:mx2]
+        if tight.size == 0:
+            return crop
+
+        k = 31 if min(tight.shape[:2]) >= 48 else 11
+        if k % 2 == 0:
+            k += 1
+        soft_bg = cv2.GaussianBlur(tight, (k, k), 0)
+        return np.where(tight_mask[:, :, None] > 0, tight, soft_bg)
 
     def _fuse_predictions(
         self,
@@ -170,8 +352,23 @@ class NeuroTrashDetector:
                 return "No Identificado", f"Posible {det_subtype}", fused_conf
             return "Orgánico", det_subtype, fused_conf
 
+        # Caso 1b: El clasificador ya conoce la clase organic (tras reentrenar con capturas Kiyo)
+        if cls_cat == "Orgánico" and cls_conf >= 0.45:
+            fused_conf = min(0.99, 0.70 * cls_conf + 0.30 * max(det_conf, 0.35))
+            if fused_conf >= self.unknown_threshold:
+                return "Orgánico", cls_subtype, fused_conf
+
         # Caso 2: Baterías, electrónicos o desechos especiales detectados explícitamente
-        if det_label in {"AA battery", "battery", "computer mouse", "cell phone", "snack wrapper"} and det_conf >= 0.22:
+        if det_label in {
+            "AA battery",
+            "battery",
+            "computer mouse",
+            "cell phone",
+            "snack wrapper",
+            "candy wrapper",
+            "chip bag",
+            "styrofoam",
+        } and det_conf >= 0.22:
             fused_conf = min(0.99, max(det_conf, 0.75))
             return "Desecho General", det_subtype, fused_conf
 
@@ -184,8 +381,19 @@ class NeuroTrashDetector:
         # Si el detector ve una botella plástica/agua pero el clasificador dudó entre glass y plastic por el brillo:
         plastic_prob = cls_probs.get("plastic", 0.0)
         glass_prob = cls_probs.get("glass", 0.0)
-        if det_label in {"plastic bottle", "water bottle", "plastic cup", "bottle"} and cls_cat == "Vidrio":
-            if det_label in {"plastic bottle", "water bottle", "plastic cup"} and (det_conf >= 0.28 or plastic_prob >= 0.12):
+        plastic_bottle_labels = {
+            "plastic bottle",
+            "water bottle",
+            "soda bottle",
+            "plastic cup",
+            "bottle",
+            "PET bottle",
+            "shampoo bottle",
+            "plastic wrapper",
+            "food wrapper",
+        }
+        if det_label in plastic_bottle_labels and cls_cat == "Vidrio":
+            if det_label != "bottle" and (det_conf >= 0.28 or plastic_prob >= 0.12):
                 fused_conf = max(det_conf, min(0.94, cls_conf * 0.85 + plastic_prob))
                 return "Plástico", "Botella PET / Plástico", fused_conf
 
@@ -280,11 +488,12 @@ class NeuroTrashDetector:
                     }
                 )
 
-        # 3. Refinar cada caja recortando el objeto y pasándolo por el clasificador de materiales entrenado
+        # 3. Silueta dentro de cada caja + recorte por máscara para clasificar material
         detections: List[Dict[str, Any]] = []
         for cand in filtered_candidates:
             x1, y1, x2, y2 = cand["bbox"]
-            crop = frame[y1:y2, x1:x2]
+            contour, mask = self._extract_object_silhouette(frame, (x1, y1, x2, y2))
+            crop = self._masked_material_crop(frame, (x1, y1, x2, y2), mask)
             cls_cat, cls_subtype, cls_conf, cls_probs = self._classify_crop_material(crop)
 
             final_cat, final_subtype, final_conf = self._fuse_predictions(
@@ -300,6 +509,7 @@ class NeuroTrashDetector:
             detections.append(
                 {
                     "bbox": (x1, y1, x2, y2),
+                    "contour": contour,
                     "category": final_cat,
                     "subtype": final_subtype,
                     "confidence": round(float(final_conf), 4),
@@ -323,5 +533,6 @@ class NeuroTrashDetector:
                 det["servo_angle"] = cat_meta["servo_angle"]
                 det["recyclable"] = cat_meta["recyclable"]
 
+        attach_entity_ids(detections)
         latency_ms = (time.perf_counter() - t0) * 1000.0
         return detections, latency_ms

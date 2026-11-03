@@ -1,14 +1,19 @@
 """
 Renderizador visual de Frames con la paleta de colores del Arcoíris:
-Dibuja cajas delimitadoras de alta visibilidad con esquinas reforzadas,
-etiquetas legibles y panel HUD con telemetría Edge/IoT.
+Dibuja un contorno de 1 px que sigue la silueta del objeto (o una caja delgada
+si el contorno falla), etiqueta compacta y panel HUD con telemetría Edge/IoT.
 """
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
 import cv2
 import numpy as np
 
 from config.settings import CATEGORIES, TARGET_LATENCY_MS
+
+
+CONTOUR_FILL_ALPHA = 0.16
+NEON_GLOW_ALPHA = 0.32
 
 
 def get_text_color_for_bg(bgr: Tuple[int, int, int]) -> Tuple[int, int, int]:
@@ -18,72 +23,102 @@ def get_text_color_for_bg(bgr: Tuple[int, int, int]) -> Tuple[int, int, int]:
     return (15, 15, 15) if luminance > 0.58 else (255, 255, 255)
 
 
-def draw_rainbow_frame(
+def _valid_contour(contour: Any) -> Optional[np.ndarray]:
+    if contour is None:
+        return None
+    arr = np.asarray(contour)
+    if arr.size < 6:
+        return None
+    if arr.ndim == 2 and arr.shape[1] == 2:
+        arr = arr.reshape(-1, 1, 2)
+    if arr.ndim != 3 or arr.shape[1] != 1 or arr.shape[2] != 2:
+        return None
+    if len(arr) < 3:
+        return None
+    return arr.astype(np.int32)
+
+
+def _draw_compact_label(
     image: np.ndarray,
-    bbox: Tuple[int, int, int, int],
-    category: str,
-    subtype: str,
-    confidence: float,
-    track_id: int = 0,
+    anchor_x: int,
+    anchor_y: int,
+    label: str,
+    color: Tuple[int, int, int],
+    text_color: Tuple[int, int, int],
 ) -> None:
-    """Dibuja el frame (bounding box) con el color del arcoíris correspondiente a la categoría."""
-    cat_info = CATEGORIES.get(category, CATEGORIES["No Identificado"])
-    color = cat_info["bgr"]
-    text_color = get_text_color_for_bg(color)
-
+    """Etiqueta pequeña anclada al punto más alto, sin placa grande."""
     h, w = image.shape[:2]
-    x1, y1, x2, y2 = bbox
-    x1, y1 = max(2, x1), max(2, y1)
-    x2, y2 = min(w - 2, x2), min(h - 2, y2)
-
-    # Sombra exterior sutil para garantizar contraste sobre fondos blancos o muy oscuros
-    cv2.rectangle(image, (x1 - 1, y1 - 1), (x2 + 1, y2 + 1), (20, 20, 20), 4, cv2.LINE_AA)
-    # Rectángulo principal con el color del arcoíris
-    cv2.rectangle(image, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
-
-    # Esquinas reforzadas tipo visor inteligente
-    box_w = x2 - x1
-    box_h = y2 - y1
-    corner_len = max(10, min(26, int(min(box_w, box_h) * 0.22)))
-    thickness = 4
-    # Superior-izquierda
-    cv2.line(image, (x1, y1), (x1 + corner_len, y1), color, thickness, cv2.LINE_AA)
-    cv2.line(image, (x1, y1), (x1, y1 + corner_len), color, thickness, cv2.LINE_AA)
-    # Superior-derecha
-    cv2.line(image, (x2, y1), (x2 - corner_len, y1), color, thickness, cv2.LINE_AA)
-    cv2.line(image, (x2, y1), (x2, y1 + corner_len), color, thickness, cv2.LINE_AA)
-    # Inferior-izquierda
-    cv2.line(image, (x1, y2), (x1 + corner_len, y2), color, thickness, cv2.LINE_AA)
-    cv2.line(image, (x1, y2), (x1, y2 - corner_len), color, thickness, cv2.LINE_AA)
-    # Inferior-derecha
-    cv2.line(image, (x2, y2), (x2 - corner_len, y2), color, thickness, cv2.LINE_AA)
-    cv2.line(image, (x2, y2), (x2, y2 - corner_len), color, thickness, cv2.LINE_AA)
-
-    # Etiqueta superior con el tipo de material, sub-etiqueta y porcentaje de precisión
-    id_prefix = f"#{track_id} " if track_id > 0 else ""
-    label = f"{id_prefix}{category} | {subtype} ({confidence * 100:.0f}%)"
-    font = cv2.FONT_HERSHEY_DUPLEX
-    font_scale = 0.52
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.38
     font_thick = 1
     (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, font_thick)
+    pad_x, pad_y = 4, 2
+    box_w = text_w + pad_x * 2
+    box_h = text_h + baseline + pad_y * 2
 
-    label_y1 = max(0, y1 - text_h - 10)
-    label_y2 = y1 if y1 - text_h - 10 >= 0 else min(h, y1 + text_h + 10)
-    label_x2 = min(w - 2, x1 + text_w + 12)
+    lx1 = int(np.clip(anchor_x - box_w // 2, 2, max(2, w - box_w - 2)))
+    ly2 = anchor_y - 3
+    ly1 = ly2 - box_h
+    if ly1 < 2:
+        ly1 = min(h - box_h - 2, anchor_y + 3)
+        ly2 = ly1 + box_h
+    lx2 = min(w - 2, lx1 + box_w)
 
-    cv2.rectangle(image, (x1, label_y1), (label_x2, label_y2), color, -1)
-    cv2.rectangle(image, (x1, label_y1), (label_x2, label_y2), (20, 20, 20), 1)
-    text_y = label_y2 - 5
+    cv2.rectangle(image, (lx1, ly1), (lx2, ly2), color, -1, cv2.LINE_AA)
     cv2.putText(
         image,
         label,
-        (x1 + 6, text_y),
+        (lx1 + pad_x, ly2 - pad_y - max(0, baseline // 2)),
         font,
         font_scale,
         text_color,
         font_thick,
         cv2.LINE_AA,
     )
+
+
+def draw_rainbow_frame(
+    image: np.ndarray,
+    bbox: Tuple[int, int, int, int],
+    category: str,
+    subtype: str,  # conservado por compatibilidad con draw_hud
+    confidence: float,
+    track_id: int = 0,
+    contour: Any = None,
+    display_id: str = "",
+) -> None:
+    """Dibuja silueta neón de 1 px (o caja delgada) con ID de categoría."""
+    cat_info = CATEGORIES.get(category, CATEGORIES["No Identificado"])
+    color = cat_info["bgr"]
+    text_color = get_text_color_for_bg(color)
+
+    h, w = image.shape[:2]
+    x1, y1, x2, y2 = bbox
+    x1, y1 = max(1, x1), max(1, y1)
+    x2, y2 = min(w - 1, x2), min(h - 1, y2)
+
+    shape = _valid_contour(contour)
+    if shape is not None:
+        glow = image.copy()
+        cv2.drawContours(glow, [shape], -1, color, thickness=5, lineType=cv2.LINE_AA)
+        cv2.addWeighted(glow, NEON_GLOW_ALPHA, image, 1.0 - NEON_GLOW_ALPHA, 0, image)
+        overlay = image.copy()
+        cv2.drawContours(overlay, [shape], -1, color, thickness=-1, lineType=cv2.LINE_AA)
+        cv2.addWeighted(overlay, CONTOUR_FILL_ALPHA, image, 1.0 - CONTOUR_FILL_ALPHA, 0, image)
+        cv2.drawContours(image, [shape], -1, color, thickness=1, lineType=cv2.LINE_AA)
+        pts = shape.reshape(-1, 2)
+        top = pts[int(np.argmin(pts[:, 1]))]
+        anchor_x, anchor_y = int(top[0]), int(top[1])
+    else:
+        glow = image.copy()
+        cv2.rectangle(glow, (x1, y1), (x2, y2), color, 4, cv2.LINE_AA)
+        cv2.addWeighted(glow, NEON_GLOW_ALPHA, image, 1.0 - NEON_GLOW_ALPHA, 0, image)
+        cv2.rectangle(image, (x1, y1), (x2, y2), color, 1, cv2.LINE_AA)
+        anchor_x, anchor_y = x1, y1
+
+    entity = display_id or (f"#{track_id}" if track_id > 0 else "")
+    label = f"{entity} {category} {confidence * 100:.0f}%".strip()
+    _draw_compact_label(image, anchor_x, anchor_y, label, color, text_color)
 
 
 def draw_hud(
@@ -103,6 +138,8 @@ def draw_hud(
             subtype=det.get("subtype", det["category"]),
             confidence=det["confidence"],
             track_id=det.get("track_id", 0),
+            contour=det.get("contour"),
+            display_id=det.get("display_id", ""),
         )
 
     h, w = output.shape[:2]
