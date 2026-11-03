@@ -226,3 +226,5 @@ __marimo__/
 dataset/capturas/
 dataset/hitl/
 dataset/img_test/_contour_preview/
+dataset_objetos/images/
+dataset_objetos/labels/

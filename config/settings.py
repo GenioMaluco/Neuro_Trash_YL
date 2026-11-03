@@ -14,6 +14,15 @@ TEST_IMAGES_DIR = DATASET_DIR / "img_test"
 HITL_DIR = DATASET_DIR / "hitl"
 HITL_CATALOG_PATH = HITL_DIR / "catalog.json"
 CAPTURES_DIR = DATASET_DIR / "capturas"
+DATASET_OBJETOS_DIR = PROJECT_DIR / "dataset_objetos"
+SEG_CLASS_BY_CATEGORY = {
+    "Plástico": 0,
+    "Metal": 1,
+    "Papel/Cartón": 2,
+    "Orgánico": 3,
+    "Vidrio": 4,
+    "Desecho General": 5,
+}
 
 # Pesos de modelos disponibles en el repositorio
 MODEL_DETECTOR_WORLD = PROJECT_DIR / "yolov8s-world.pt"

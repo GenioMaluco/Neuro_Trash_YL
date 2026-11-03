@@ -59,25 +59,33 @@ Cada objeto detectado recibe un recuadro (*Frame*) con esquinas reforzadas del c
 
 ```text
 Neuro_Trash_YL/
-├── app_web.py                 # Interfaz Web en Streamlit (Cámara local, Vínculo Móvil/VDO.Ninja, Telemetría RPi)
+├── app_web.py                 # Interfaz Web en Streamlit (cámara, teléfono, laboratorio HITL, telemetría RPi)
 ├── main.py                    # Punto de entrada CLI (--camera, --stream-url, --vdo-url, --images)
 ├── camara.py                  # Lanzador rápido retrocompatible con versiones previas
 ├── diagnostico_obs_vdo.py     # Utilidad de diagnóstico para OBS Virtual Camera y enlaces VDO.Ninja
-├── entrenar_yolo.py           # Entrenamiento del modelo YOLOv8 de clasificación de materiales
-├── evalua.py                  # Evaluación de métricas Top-1 Accuracy sobre validación
-├── dividir_dataset.py         # Particionamiento 80/20 (train/val) del dataset de residuos
-├── captura_imagen.py          # Herramienta de captura rápida de muestras por clase
+├── entrenar_yolo.py           # Fine-tune del clasificador YOLOv8n-cls (materiales)
+├── evalua.py                  # Evaluación Top-1 / Top-5 sobre dataset_yolo/val
+├── dividir_dataset.py         # Mezcla TrashNet + capturas locales y parte 80/20 (train/val)
+├── captura_imagen.py          # Captura rápida por clase desde USB u OBS (teclas s / q)
 ├── config/
-│   ├── settings.py            # Configuración central: 7 categorías Arcoíris, prompts YOLO, pines GPIO RPi
-│   └── data_residuos.yaml     # Especificación de clases para entrenamiento de detección con cajas
+│   ├── settings.py            # 7 categorías Arcoíris, prompts YOLO, pines GPIO, umbrales
+│   └── data_residuos.yaml     # Clases para un futuro detector/segmentador nativo (dataset_objetos)
 ├── src/
-│   ├── detector.py            # Motor YOLO Híbrido de 2 etapas (Localización de Caja + Clasificador de Recorte)
-│   ├── stabilizer.py          # Tracker Multi-Objeto por IoU + Votación temporal para suavizar Frames
-│   ├── visualizer.py          # Renderizador OpenCV de Frames Arcoíris y barra HUD de latencia Edge
-│   ├── camera_sources.py      # Gestor de cámaras (DSHOW/MSMF, OBS Virtual Cam, Win32 Window Capture, URLs)
-│   └── telemetry.py           # Controlador GPIO de Raspberry Pi (gpiozero) y generador de JSON MQTT
+│   ├── detector.py            # Motor YOLO híbrido de 2 etapas (caja/silueta + clasificador de recorte)
+│   ├── stabilizer.py          # Tracker multi-objeto por IoU + votación temporal
+│   ├── visualizer.py          # Frames Arcoíris, IDs de categoría y HUD de latencia
+│   ├── camera_sources.py      # Cámaras USB, OBS Virtual Cam, captura de ventana y URLs
+│   ├── telemetry.py           # GPIO Raspberry Pi (gpiozero) y payload MQTT
+│   ├── hitl.py                # Catálogo ER, recortes, máscaras y lanzamiento del fine-tune
+│   └── hitl_click_canvas.py   # Lienzo clicable: cada clic agrega un punto del contorno
+├── dataset/
+│   ├── Garbage classification/  # TrashNet público (plastic, metal, paper, cardboard, glass, trash)
+│   ├── capturas/                # Recortes locales HITL / Kiyo (gitignorado)
+│   ├── hitl/catalog.json        # Relación Categoría → Tipo de objeto → Muestra (gitignorado)
+│   └── img_test/                # Imágenes de laboratorio / demostración
+├── dataset_yolo/              # Dataset listo para Ultralytics (se regenera con dividir_dataset.py)
 └── runs/residuos/weights/
-    └── best.pt                # Pesos entrenados del clasificador de materiales (92.74% Top-1 Accuracy)
+    └── best.pt                # Pesos actuales del clasificador de materiales
 ```
 
 ---
@@ -91,18 +99,62 @@ cd Neuro_Trash_YL
 pip install -r requirements.txt
 ```
 
-### Paso 2: Ejecutar la Interfaz Web en Streamlit (Recomendado para demostraciones)
+### Paso 2: Ejecutar la Interfaz Web en Streamlit (Recomendado)
 ```powershell
 streamlit run app_web.py
 ```
-Dentro de la aplicación web podrás alternar en tiempo real entre:
-1. **📷 Cámara Instalada (USB / CSI / OBS):** Escanea los índices del sistema o captura directamente la ventana de OBS Studio.
-2. **📱 Vínculo de Sitio Web / Teléfono:**
-   - **VDO.Ninja + OBS:** Pega tu vínculo `https://vdo.ninja/?view=TU_ID`, copia el enlace auto-optimizado (`&cleanoutput&autostart`) en una fuente *Navegador* (*Browser Source*) de OBS Studio, inicia la Cámara Virtual de OBS y activa el procesamiento en vivo.
-   - **Stream Directo IP:** Conecta apps como *IP Webcam* (`http://192.168.x.x:8080/video`) o *DroidCam*.
-3. **🖼️ Laboratorio de Imágenes:** Evalúa imágenes del repositorio (`dataset/img_test`) o sube fotografías propias para inspeccionar el payload MQTT y el ángulo del servomotor.
 
-### Paso 3: Ejecutar desde Consola / CLI (`main.py`)
+La barra lateral permite elegir el motor (`world_hybrid` = máxima precisión, `fast_hybrid` = más rápido en Raspberry Pi) y tres umbrales:
+
+| Control | Qué hace |
+| :--- | :--- |
+| **Umbral de Detección de Caja** | Confianza mínima para encerrar un objeto. Bájalo si YOLO no ve el residuo. |
+| **Umbral de Certeza de Material** | Si el clasificador queda por debajo, el objeto se marca **No Identificado** (magenta). |
+| **Estabilización Temporal** | Vota la categoría durante *N* fotogramas para que el recuadro no parpadee. |
+
+### Paso 3: Usar las tres fuentes de la herramienta
+
+#### 📷 Cámara instalada (USB / CSI / OBS)
+1. Elige **Cámara USB** o **Cámara OBS**. No se mezclan: USB nunca abre la cámara virtual de OBS.
+2. Pulsa **Escanear dispositivos** si la webcam está ocupada (cierra Chrome, la app Cámara u otra pestaña de Streamlit).
+3. Activa **Iniciar detección en tiempo real**.
+4. Cuando el recuadro sea útil para entrenar, pulsa **Enviar frame a entrenamiento HITL**. Eso congela el fotograma y abre el laboratorio.
+
+#### 📱 Teléfono (URL / VDO.Ninja)
+- **Stream directo:** IP Webcam o DroidCam, por ejemplo `http://192.168.1.50:8080/video`. El teléfono y la PC/Raspberry Pi deben estar en la misma Wi-Fi.
+- **VDO.Ninja + OBS:** pega `https://vdo.ninja/?view=TU_ID`, copia el enlace optimizado (`&cleanoutput&autostart`) en una fuente *Navegador* de OBS, inicia la Cámara Virtual y procesa desde el índice detectado.
+- **Cámara del navegador:** abre la app Streamlit en el teléfono (misma red) y usa la pestaña *Abrir Web desde el Teléfono*.
+
+#### 🖼️ Laboratorio e entrenamiento HITL
+Sirve para corregir al modelo y generar nuevas muestras. Puedes partir de:
+
+1. El **frame enviado** desde la cámara en vivo.
+2. Una **foto del dispositivo** (`st.camera_input`).
+3. Un **archivo subido**.
+4. Una imagen de `dataset/img_test`.
+
+Por cada objeto detectado (o agregado a mano):
+
+1. Haz **clic sobre el frame** para dibujar el contorno en orden (mínimo 3 puntos). La línea sigue la silueta, no solo la caja.
+2. Usa **Más puntos**, **Borrar** o **Restablecer**, o mueve un punto con los sliders X/Y.
+3. Marca si la categoría es **Correcto** o **Corregir**.
+4. Elige la **categoría del arcoíris** y el **tipo de objeto** (botella PET, lata, tetra pak, cáscara, etc.). Puedes crear un tipo nuevo.
+5. En Papel/Cartón, indica si la clase de entrenamiento es `paper` o `cardboard`.
+6. Pulsa **Guardar etiquetas y máscaras para entrenamiento**.
+
+Cada muestra guardada produce:
+
+- Recorte del objeto en `dataset/capturas/<clase>/` (lo que usa el clasificador).
+- Máscara PNG del contorno.
+- Entrada en `dataset/hitl/catalog.json` (`CAT-*` → `OBJ-*` → `SMP-*`).
+- Imagen + etiqueta YOLO-seg en `dataset_objetos/` para un detector nativo futuro.
+
+Luego, en **Catálogo ER y reentrenamiento**:
+
+- **Preparar dataset_yolo** ejecuta `dividir_dataset.py`.
+- **Reentrenar clasificador** prepara el dataset y lanza `entrenar_yolo.py` en segundo plano. El log queda en `dataset/hitl/train.log`.
+
+### Paso 4: Ejecutar desde Consola / CLI (`main.py`)
 ```powershell
 # Evaluar las imágenes de prueba en dataset/img_test:
 python main.py
@@ -119,7 +171,89 @@ python main.py --stream-url http://192.168.1.50:8080/video
 
 ---
 
-## 🗺️ 6. Siguientes Pasos para Completar el Proyecto (Hoja de Ruta Semanas 10–15)
+## 🧠 6. Cómo Funciona el Entrenamiento del Modelo
+
+El sistema es de **dos etapas**. Solo se reentrena de forma rutinaria la segunda:
+
+| Etapa | Modelo | Qué aprende | Se reentrena con HITL |
+| :--- | :--- | :--- | :---: |
+| **1. Localizar** | `yolov8s-world.pt` (precisión) o `yolov8n.pt` (rápido) | Dónde está el objeto y su silueta | No. Usa prompts en `config/settings.py` |
+| **2. Clasificar material** | `runs/residuos/weights/best.pt` (YOLOv8n-cls) | Si el recorte es plástico, metal, papel, cartón, vidrio, basura u orgánico | Sí |
+
+Las clases entrenables son: `plastic`, `metal`, `paper`, `cardboard`, `glass`, `trash`, `organic`.
+
+### 6.1 Ciclo recomendado (Human-in-the-Loop)
+
+```text
+Cámara en vivo  →  Enviar frame a HITL  →  Corregir contorno y categoría
+        ↓
+dataset/capturas/<clase>  +  catalog.json
+        ↓
+python dividir_dataset.py     (o el botón "Preparar dataset_yolo")
+        ↓
+python entrenar_yolo.py       (o el botón "Reentrenar clasificador")
+        ↓
+runs/residuos/weights/best.pt  →  python evalua.py  →  reiniciar Streamlit
+```
+
+Tras un fine-tune exitoso **reinicia la app** (`Ctrl+C` y `streamlit run app_web.py`) para que `@st.cache_resource` recargue `best.pt`.
+
+### 6.2 Captura masiva por consola (opcional)
+
+Si quieres muchas fotos de un solo material, sin pasar por el lienzo HITL:
+
+```powershell
+python captura_imagen.py --clase plastic
+python captura_imagen.py --clase organic
+python captura_imagen.py --clase metal --kind obs
+```
+
+Teclas: `s` guarda el fotograma en `dataset/capturas/<clase>/`, `q` sale. Meta útil: **80–150 fotos por clase**, con distintos ángulos, distancias e iluminación. Cierra Streamlit/Chrome si la webcam queda ocupada.
+
+### 6.3 Armar `dataset_yolo`
+
+```powershell
+python dividir_dataset.py
+```
+
+El script:
+
+1. Borra y recrea `dataset_yolo/`.
+2. Mezcla **TrashNet** (`dataset/Garbage classification`) con las **capturas locales**.
+3. Parte **80 % train / 20 % val**.
+4. Si hay pocas fotos de la cámara real, las **repite en train** hasta ~80 por clase para que el fine-tune no ignore el dominio de la Kiyo/Raspberry Pi.
+
+No hace falta commitear `dataset_yolo` ni `dataset/capturas/`: se regeneran en cada máquina.
+
+### 6.4 Fine-tune del clasificador
+
+```powershell
+python entrenar_yolo.py
+```
+
+Parte de `runs/residuos/weights/best.pt` si existe; si no, de `yolov8n-cls.pt`. Hiperparámetros actuales:
+
+- **50 épocas**, `imgsz=256`, `batch=32`, `patience=15`
+- Aumentos: HSV, volteo horizontal, rotación ±12°, traslación y escala
+- Salida: `runs/residuos/` (sobrescribe el run anterior con `exist_ok=True`)
+
+En la app, el botón **Reentrenar clasificador** hace lo mismo en segundo plano. Si ya hay un job, verás *en curso* hasta que termine.
+
+### 6.5 Evaluar el modelo
+
+```powershell
+python evalua.py
+```
+
+Imprime Top-1 y Top-5 sobre `dataset_yolo/val`. Úsalo después de cada fine-tune para comprobar que el material local (cámara real) mejoró sin destruir el desempeño en TrashNet.
+
+### 6.6 Qué no se reentrena todavía
+
+El **localizador** (YOLO-World / YOLOv8n) no se fine-tunea en este ciclo. Si un objeto nunca aparece, primero baja el umbral de caja o amplía `WORLD_WASTE_PROMPTS` en `config/settings.py`. Las máscaras HITL ya se guardan en `dataset_objetos/` + `config/data_residuos.yaml` para, en una fase posterior, entrenar un detector/segmentador nativo de residuos.
+
+---
+
+## 🗺️ 7. Siguientes Pasos para Completar el Proyecto (Hoja de Ruta Semanas 10–15)
 
 Para cerrar con éxito los entregables restantes del curso (**Avance 3 en Semana 13**, **Caso de Investigación** y **Entrega Final / Defensa en Semana 15**), el equipo seguirá este plan de trabajo:
 
